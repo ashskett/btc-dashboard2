@@ -293,23 +293,45 @@ function liqCorr(a,b,n=20){
   return da===0||db===0?0:num/Math.sqrt(da*db);
 }
 async function fetchLiqData() {
-  async function stooq(sym) {
+  // Yahoo Finance v8 chart API — returns JSON with OHLC arrays
+  // period2 = far future, period1 = ~1 year ago, interval = 1d
+  function withTimeout(p,ms){return new Promise(function(res,rej){var t=setTimeout(function(){rej(new Error("to"));},ms);p.then(function(v){clearTimeout(t);res(v);},function(e){clearTimeout(t);rej(e);});});}
+
+  async function yahooCloses(ticker) {
+    var period1=Math.floor((Date.now()/1000)-220*86400);
+    var period2=Math.floor(Date.now()/1000+86400);
+    var url="https://query1.finance.yahoo.com/v8/finance/chart/"+ticker+"?period1="+period1+"&period2="+period2+"&interval=1d&includePrePost=false";
+    // Try direct first
     try {
-      const url="https://stooq.com/q/d/l/?s="+sym+"&i=d";
-      function withTimeout(p,ms){return new Promise(function(res,rej){var t=setTimeout(function(){rej(new Error("to"));},ms);p.then(function(v){clearTimeout(t);res(v);},function(e){clearTimeout(t);rej(e);});});}
-      var r=await withTimeout(fetch("https://api.allorigins.win/get?url="+encodeURIComponent(url)),14000);
-      if(!r.ok)return null;
-      var j=await r.json();
-      var lines=(j.contents||"").split("\n").filter(function(l){return l&&!l.startsWith("Date");});
-      if(!lines.length)return null;
-      var closes=[];
-      lines.slice(-220).forEach(function(l){var p=l.split(",");if(p[4]&&!isNaN(parseFloat(p[4])))closes.push(parseFloat(p[4]));});
-      return closes.length>10?closes:null;
-    }catch(_){return null;}
+      var r=await withTimeout(fetch(url),7000);
+      if(r.ok){
+        var j=await r.json();
+        var c=j&&j.chart&&j.chart.result&&j.chart.result[0]&&j.chart.result[0].indicators&&j.chart.result[0].indicators.quote&&j.chart.result[0].indicators.quote[0]&&j.chart.result[0].indicators.quote[0].close;
+        if(c&&c.length>10)return c.filter(function(v){return v!=null&&!isNaN(v);});
+      }
+    }catch(_){}
+    // Proxy fallback
+    try {
+      var r2=await withTimeout(fetch("https://api.allorigins.win/get?url="+encodeURIComponent(url)),18000);
+      if(!r2.ok)return null;
+      var j2=await r2.json();
+      var parsed=JSON.parse(j2.contents||"{}");
+      var c2=parsed&&parsed.chart&&parsed.chart.result&&parsed.chart.result[0]&&parsed.chart.result[0].indicators&&parsed.chart.result[0].indicators.quote&&parsed.chart.result[0].indicators.quote[0]&&parsed.chart.result[0].indicators.quote[0].close;
+      if(c2&&c2.length>10)return c2.filter(function(v){return v!=null&&!isNaN(v);});
+    }catch(_){}
+    return null;
   }
-  const [dxyC,goldC,us10yC,vixC]=await Promise.all([stooq("dxy"),stooq("xauusd"),stooq("tnx"),stooq("vix")]);
+
+  // Yahoo tickers: DX-Y.NYB = DXY, GC=F = Gold futures, ^TNX = US10Y, ^VIX = VIX
+  var results=await Promise.all([
+    yahooCloses("DX-Y.NYB"),
+    yahooCloses("GC%3DF"),
+    yahooCloses("%5ETNX"),
+    yahooCloses("%5EVIX"),
+  ]);
+  var dxyC=results[0], goldC=results[1], us10yC=results[2], vixC=results[3];
   function toWeekly(c){if(!c||c.length<5)return c;var w=[];for(var i=4;i<c.length;i+=5)w.push(c[i]);return w;}
-  return {dxyC,dxyW:toWeekly(dxyC),goldC,us10yC,vixC};
+  return {dxyC,dxyW:toWeekly(dxyC),goldC,us10yC,vixC,status:{dxy:!!dxyC,gold:!!goldC,us10y:!!us10yC,vix:!!vixC}};
 }
 function calcLiqScore(ld, btcD) {
   if(!ld)return {score:null,regime:"—",action:"—",sigs:{},vixAmp:0};
@@ -360,6 +382,7 @@ function calcLiqScore(ld, btcD) {
   const action=regime==="GREEN"?"Risk-on · Accumulation OK · Leverage allowed":regime==="AMBER"?"Reduce leverage · Tighten stops · Raise cash":"No leverage · Hedge BTC · Defensives only";
   return {
     score:Math.round(score*10)/10, regime, action, vixAmp:vAmp,
+    feedStatus:{dxy:!!dxyC,gold:!!goldC,us10y:!!us10yC,vix:!!vixC},
     sigs:{
       dxy:{n:dxyN,of:4,val:dxyC?dxyC[dxyC.length-1].toFixed(2):null,rsi:dxyRSI?dxyRSI.toFixed(1):null},
       us10y:{n:yN,of:3,val:us10yC?us10yC[us10yC.length-1].toFixed(3)+"%":null,rsi:yRSI?yRSI.toFixed(1):null},
@@ -433,6 +456,14 @@ function LiquidityPanel({liq,liqLoading}){
             </div>
           );
         })}
+      </div>
+      {/* Feed status */}
+      <div style={{marginTop:10,display:"flex",gap:10,flexWrap:"wrap"}}>
+        {liq&&liq.feedStatus&&Object.entries(liq.feedStatus).map(function([k,ok]){
+          return<span key={k} style={{fontSize:8,color:ok?"#4ade80":"#ff4d6d",background:ok?"rgba(74,222,128,0.07)":"rgba(255,77,109,0.07)",border:"1px solid "+(ok?"rgba(74,222,128,0.2)":"rgba(255,77,109,0.2)"),borderRadius:4,padding:"2px 7px"}}>{ok?"✓":"✗"} {k.toUpperCase()}</span>;
+        })}
+        {liqLoading&&<span style={{fontSize:8,color:"rgba(255,255,255,0.3)"}}>⟳ fetching macro feeds…</span>}
+        {liq&&!liqLoading&&<span style={{fontSize:8,color:"rgba(255,255,255,0.2)"}}>· Yahoo Finance · refreshes every 5 min</span>}
       </div>
     </div>
   );

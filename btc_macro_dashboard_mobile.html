@@ -80,44 +80,41 @@ function corrPearson(a,b,n=20){
 }
 
 // ── Fetch Liquidity Monitor data (free public sources) ───────
-async function fetchLiquidityData(t) {
-  // We use Binance weekly OHLC already available for BTC.
-  // For DXY, Gold, US10Y, VIX we pull from stooq.com (free CSV-like API)
-  // which is freely accessible and doesn't require keys.
-  async function stooq(sym) {
+async function fetchLiquidityData() {
+  function withTimeout(p,ms){return new Promise(function(res,rej){var t2=setTimeout(function(){rej(new Error("to"));},ms);p.then(function(v){clearTimeout(t2);res(v);},function(e){clearTimeout(t2);rej(e);});});}
+
+  async function yahooCloses(ticker) {
+    var period1=Math.floor((Date.now()/1000)-220*86400);
+    var period2=Math.floor(Date.now()/1000+86400);
+    var url="https://query1.finance.yahoo.com/v8/finance/chart/"+ticker+"?period1="+period1+"&period2="+period2+"&interval=1d&includePrePost=false";
     try {
-      const url = "https://stooq.com/q/d/l/?s="+sym+"&i=d";
-      var r = await (function withTimeout(p,ms){return new Promise(function(res,rej){var t2=setTimeout(function(){rej(new Error("to"));},ms);p.then(function(v){clearTimeout(t2);res(v);},function(e){clearTimeout(t2);rej(e);});});})( fetch("https://api.allorigins.win/get?url="+encodeURIComponent(url)), 14000 );
-      if(!r.ok)return null;
-      var j=await r.json();
-      var lines=(j.contents||"").split("\n").filter(function(l){return l&&!l.startsWith("Date");});
-      if(!lines.length)return null;
-      // parse close prices (col 4) from last 220 rows
-      var closes=[];
-      var sl=lines.slice(-220);
-      sl.forEach(function(l){var p=l.split(",");if(p[4]&&!isNaN(parseFloat(p[4])))closes.push(parseFloat(p[4]));});
-      return closes.length>10?closes:null;
-    } catch(_){return null;}
+      var r=await withTimeout(fetch(url),7000);
+      if(r.ok){
+        var j=await r.json();
+        var c=j&&j.chart&&j.chart.result&&j.chart.result[0]&&j.chart.result[0].indicators&&j.chart.result[0].indicators.quote&&j.chart.result[0].indicators.quote[0]&&j.chart.result[0].indicators.quote[0].close;
+        if(c&&c.length>10)return c.filter(function(v){return v!=null&&!isNaN(v);});
+      }
+    }catch(_){}
+    try {
+      var r2=await withTimeout(fetch("https://api.allorigins.win/get?url="+encodeURIComponent(url)),18000);
+      if(!r2.ok)return null;
+      var j2=await r2.json();
+      var parsed=JSON.parse(j2.contents||"{}");
+      var c2=parsed&&parsed.chart&&parsed.chart.result&&parsed.chart.result[0]&&parsed.chart.result[0].indicators&&parsed.chart.result[0].indicators.quote&&parsed.chart.result[0].indicators.quote[0]&&parsed.chart.result[0].indicators.quote[0].close;
+      if(c2&&c2.length>10)return c2.filter(function(v){return v!=null&&!isNaN(v);});
+    }catch(_){}
+    return null;
   }
 
-  const [dxyC,goldC,us10yC,vixC]=await Promise.all([
-    stooq("dxy"),
-    stooq("xauusd"),
-    stooq("tnx"),   // US 10Y yield (^TNX)
-    stooq("vix"),
+  var results=await Promise.all([
+    yahooCloses("DX-Y.NYB"),
+    yahooCloses("GC%3DF"),
+    yahooCloses("%5ETNX"),
+    yahooCloses("%5EVIX"),
   ]);
-
-  // Weekly closing prices for DXY (we build weekly from daily by grouping)
-  function toWeekly(closes){
-    if(!closes||closes.length<5)return closes;
-    // approximate: take every 5th
-    var wkly=[];
-    for(var i=4;i<closes.length;i+=5)wkly.push(closes[i]);
-    return wkly;
-  }
-  const dxyW=toWeekly(dxyC);
-
-  return {dxyC,dxyW,goldC,us10yC,vixC};
+  var dxyC=results[0], goldC=results[1], us10yC=results[2], vixC=results[3];
+  function toWeekly(c){if(!c||c.length<5)return c;var w=[];for(var i=4;i<c.length;i+=5)w.push(c[i]);return w;}
+  return {dxyC,dxyW:toWeekly(dxyC),goldC,us10yC,vixC,status:{dxy:!!dxyC,gold:!!goldC,us10y:!!us10yC,vix:!!vixC}};
 }
 
 function calcLiquidityScore(ld, btcDailyCloses) {
@@ -668,7 +665,7 @@ function App(){
   const fetchLiq=useCallback(async()=>{
     setLiqLoading(true);
     try{
-      const ld=await fetchLiquidityData(tracked);
+      const ld=await fetchLiquidityData();
       // Get BTC daily closes from existing data or re-fetch
       const btcRaw=await tracked("https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1d&limit=220",null);
       const btcCloses=btcRaw?btcRaw.map(function(c){return parseFloat(c[4]);}):null;

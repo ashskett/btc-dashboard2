@@ -83,35 +83,69 @@ function corrPearson(a,b,n=20){
 async function fetchLiquidityData() {
   function withTimeout(p,ms){return new Promise(function(res,rej){var t2=setTimeout(function(){rej(new Error("to"));},ms);p.then(function(v){clearTimeout(t2);res(v);},function(e){clearTimeout(t2);rej(e);});});}
 
-  async function yahooCloses(ticker) {
+  async function fetchDXY() {
     var period1=Math.floor((Date.now()/1000)-220*86400);
     var period2=Math.floor(Date.now()/1000+86400);
-    var url="https://query1.finance.yahoo.com/v8/finance/chart/"+ticker+"?period1="+period1+"&period2="+period2+"&interval=1d&includePrePost=false";
+    var url="https://query1.finance.yahoo.com/v8/finance/chart/DX-Y.NYB?period1="+period1+"&period2="+period2+"&interval=1d";
     try {
-      var r=await withTimeout(fetch(url),7000);
-      if(r.ok){
-        var j=await r.json();
-        var c=j&&j.chart&&j.chart.result&&j.chart.result[0]&&j.chart.result[0].indicators&&j.chart.result[0].indicators.quote&&j.chart.result[0].indicators.quote[0]&&j.chart.result[0].indicators.quote[0].close;
-        if(c&&c.length>10)return c.filter(function(v){return v!=null&&!isNaN(v);});
-      }
+      var r=await withTimeout(fetch(url),8000);
+      if(r.ok){var j=await r.json();var c=j&&j.chart&&j.chart.result&&j.chart.result[0]&&j.chart.result[0].indicators.quote[0].close;if(c&&c.length>10)return c.filter(function(v){return v!=null&&!isNaN(v);});}
     }catch(_){}
     try {
       var r2=await withTimeout(fetch("https://api.allorigins.win/get?url="+encodeURIComponent(url)),18000);
-      if(!r2.ok)return null;
-      var j2=await r2.json();
-      var parsed=JSON.parse(j2.contents||"{}");
-      var c2=parsed&&parsed.chart&&parsed.chart.result&&parsed.chart.result[0]&&parsed.chart.result[0].indicators&&parsed.chart.result[0].indicators.quote&&parsed.chart.result[0].indicators.quote[0]&&parsed.chart.result[0].indicators.quote[0].close;
-      if(c2&&c2.length>10)return c2.filter(function(v){return v!=null&&!isNaN(v);});
+      if(r2.ok){var j2=await r2.json();var p2=JSON.parse(j2.contents||"{}");var c2=p2&&p2.chart&&p2.chart.result&&p2.chart.result[0]&&p2.chart.result[0].indicators.quote[0].close;if(c2&&c2.length>10)return c2.filter(function(v){return v!=null&&!isNaN(v);});}
     }catch(_){}
     return null;
   }
 
-  var results=await Promise.all([
-    yahooCloses("DX-Y.NYB"),
-    yahooCloses("GC%3DF"),
-    yahooCloses("%5ETNX"),
-    yahooCloses("%5EVIX"),
-  ]);
+  async function fetchGold() {
+    try {
+      var r=await withTimeout(fetch("https://api.binance.com/api/v3/klines?symbol=XAUUSDT&interval=1d&limit=220"),8000);
+      if(!r.ok)return null;
+      var j=await r.json();
+      if(!j||!j.length)return null;
+      return j.map(function(k){return parseFloat(k[4]);}).filter(function(v){return !isNaN(v);});
+    }catch(_){return null;}
+  }
+
+  async function fetchUS10Y() {
+    var url="https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS10";
+    try {
+      var r=await withTimeout(fetch(url),8000);
+      if(r.ok){
+        var txt=await r.text();
+        var lines=txt.split("\n").filter(function(l){return l&&!l.startsWith("DATE")&&l.indexOf(".")>-1;});
+        var vals=lines.map(function(l){var p=l.split(",");return parseFloat(p[1]);}).filter(function(v){return !isNaN(v);});
+        if(vals.length>10)return vals.slice(-220);
+      }
+    }catch(_){}
+    try {
+      var r2=await withTimeout(fetch("https://api.allorigins.win/get?url="+encodeURIComponent(url)),18000);
+      if(r2.ok){
+        var j2=await r2.json();
+        var lines2=(j2.contents||"").split("\n").filter(function(l){return l&&!l.startsWith("DATE")&&l.indexOf(".")>-1;});
+        var vals2=lines2.map(function(l){var p=l.split(",");return parseFloat(p[1]);}).filter(function(v){return !isNaN(v);});
+        if(vals2.length>10)return vals2.slice(-220);
+      }
+    }catch(_){}
+    return null;
+  }
+
+  async function fetchVIX() {
+    var period1=Math.floor((Date.now()/1000)-220*86400);
+    var period2=Math.floor(Date.now()/1000+86400);
+    try {
+      var r=await withTimeout(fetch("https://query1.finance.yahoo.com/v8/finance/chart/%5EVIX?period1="+period1+"&period2="+period2+"&interval=1d"),8000);
+      if(r.ok){var j=await r.json();var c=j&&j.chart&&j.chart.result&&j.chart.result[0]&&j.chart.result[0].indicators.quote[0].close;if(c&&c.length>10)return c.filter(function(v){return v!=null&&!isNaN(v);});}
+    }catch(_){}
+    try {
+      var r2=await withTimeout(fetch("https://query2.finance.yahoo.com/v8/finance/chart/%5EVIX?period1="+period1+"&period2="+period2+"&interval=1d"),8000);
+      if(r2.ok){var j2=await r2.json();var c2=j2&&j2.chart&&j2.chart.result&&j2.chart.result[0]&&j2.chart.result[0].indicators.quote[0].close;if(c2&&c2.length>10)return c2.filter(function(v){return v!=null&&!isNaN(v);});}
+    }catch(_){}
+    return null;
+  }
+
+  var results=await Promise.all([fetchDXY(), fetchGold(), fetchUS10Y(), fetchVIX()]);
   var dxyC=results[0], goldC=results[1], us10yC=results[2], vixC=results[3];
   function toWeekly(c){if(!c||c.length<5)return c;var w=[];for(var i=4;i<c.length;i+=5)w.push(c[i]);return w;}
   return {dxyC,dxyW:toWeekly(dxyC),goldC,us10yC,vixC,status:{dxy:!!dxyC,gold:!!goldC,us10y:!!us10yC,vix:!!vixC}};

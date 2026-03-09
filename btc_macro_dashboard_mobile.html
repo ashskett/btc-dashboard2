@@ -52,17 +52,260 @@ const bil  = n => n==null?"—":"$"+(n/1e9).toFixed(2)+"B";
 const SIG  = {bull:"#00e5a0", bear:"#ff4d6d", neutral:"#8892a4"};
 const REFRESH = 60000;
 
-async function tracked(url, fb=null, errs=[], proxied=[]) {
+// ── Liquidity Monitor helpers ────────────────────────────────
+function sma(arr, n) {
+  if (!arr || arr.length < n) return null;
+  return arr.slice(-n).reduce((a,b)=>a+b,0)/n;
+}
+function rsiArr(arr, n=14) {
+  if (!arr || arr.length < n+1) return null;
+  let ag=0,al=0;
+  for(let i=1;i<=n;i++){const d=arr[i]-arr[i-1];d>=0?ag+=d:al-=d;}
+  ag/=n;al/=n;
+  for(let i=n+1;i<arr.length;i++){const d=arr[i]-arr[i-1];ag=(ag*(n-1)+(d>=0?d:0))/n;al=(al*(n-1)+(d<0?-d:0))/n;}
+  return al===0?100:100-(100/(1+ag/al));
+}
+function pctChg10d(arr) {
+  if(!arr||arr.length<11)return null;
+  const prev=arr[arr.length-11],cur=arr[arr.length-1];
+  return prev>0?(cur-prev)/prev*100:null;
+}
+function corrPearson(a,b,n=20){
+  if(!a||!b||a.length<n||b.length<n)return null;
+  const ax=a.slice(-n),bx=b.slice(-n);
+  const ma=ax.reduce((s,v)=>s+v,0)/n,mb=bx.reduce((s,v)=>s+v,0)/n;
+  let num=0,da=0,db=0;
+  for(let i=0;i<n;i++){const x=ax[i]-ma,y=bx[i]-mb;num+=x*y;da+=x*x;db+=y*y;}
+  return da===0||db===0?0:num/Math.sqrt(da*db);
+}
+
+// ── Fetch Liquidity Monitor data (free public sources) ───────
+async function fetchLiquidityData(t) {
+  // We use Binance weekly OHLC already available for BTC.
+  // For DXY, Gold, US10Y, VIX we pull from stooq.com (free CSV-like API)
+  // which is freely accessible and doesn't require keys.
+  async function stooq(sym) {
+    try {
+      const url = "https://stooq.com/q/d/l/?s="+sym+"&i=d";
+      var r = await (function withTimeout(p,ms){return new Promise(function(res,rej){var t2=setTimeout(function(){rej(new Error("to"));},ms);p.then(function(v){clearTimeout(t2);res(v);},function(e){clearTimeout(t2);rej(e);});});})( fetch("https://api.allorigins.win/get?url="+encodeURIComponent(url)), 14000 );
+      if(!r.ok)return null;
+      var j=await r.json();
+      var lines=(j.contents||"").split("\n").filter(function(l){return l&&!l.startsWith("Date");});
+      if(!lines.length)return null;
+      // parse close prices (col 4) from last 220 rows
+      var closes=[];
+      var sl=lines.slice(-220);
+      sl.forEach(function(l){var p=l.split(",");if(p[4]&&!isNaN(parseFloat(p[4])))closes.push(parseFloat(p[4]));});
+      return closes.length>10?closes:null;
+    } catch(_){return null;}
+  }
+
+  const [dxyC,goldC,us10yC,vixC]=await Promise.all([
+    stooq("dxy"),
+    stooq("xauusd"),
+    stooq("tnx"),   // US 10Y yield (^TNX)
+    stooq("vix"),
+  ]);
+
+  // Weekly closing prices for DXY (we build weekly from daily by grouping)
+  function toWeekly(closes){
+    if(!closes||closes.length<5)return closes;
+    // approximate: take every 5th
+    var wkly=[];
+    for(var i=4;i<closes.length;i+=5)wkly.push(closes[i]);
+    return wkly;
+  }
+  const dxyW=toWeekly(dxyC);
+
+  return {dxyC,dxyW,goldC,us10yC,vixC};
+}
+
+function calcLiquidityScore(ld, btcDailyCloses) {
+  if(!ld)return {score:null,regime:"—",sigs:{},detail:{}};
+  const {dxyC,dxyW,goldC,us10yC,vixC}=ld;
+
+  // ── DXY signals (weight 55%) ──────────────────────────────
+  const dxy200=sma(dxyC,200);
+  const sig1 = dxyC&&dxy200&&dxyC[dxyC.length-1]>dxy200;
+
+  // Weekly close > 52-week high (prior)
+  const dxyW52High = dxyW&&dxyW.length>52?Math.max(...dxyW.slice(-53,-1)):null;
+  const sig2 = dxyW&&dxyW52High&&dxyW[dxyW.length-1]>dxyW52High;
+
+  const dxy10d = pctChg10d(dxyC);
+  const sig3 = dxy10d!=null&&dxy10d>=2.5;
+
+  const dxyRSI = rsiArr(dxyC,14);
+  const sig4 = dxyRSI!=null&&dxyRSI>=60;
+
+  const dxyCount=(sig1?1:0)+(sig2?1:0)+(sig3?1:0)+(sig4?1:0);
+  const scoreDXY=(dxyCount/4)*55;
+
+  // ── US10Y signals (weight 20%) ────────────────────────────
+  const us10y200=sma(us10yC,200);
+  const y1=us10yC&&us10y200&&us10yC[us10yC.length-1]>us10y200;
+  const us10y10d=pctChg10d(us10yC);
+  const y2=us10y10d!=null&&us10y10d>=2.0;
+  const yldRSI=rsiArr(us10yC,14);
+  const y3=yldRSI!=null&&yldRSI>=60;
+  const yldCount=(y1?1:0)+(y2?1:0)+(y3?1:0);
+  const scoreYLD=(yldCount/3)*20;
+
+  // ── Gold signals (weight 15%) ─────────────────────────────
+  const gold50=sma(goldC,50);
+  const g1=goldC&&gold50&&dxyC&&dxy200&&goldC[goldC.length-1]<gold50&&dxyC[dxyC.length-1]>dxy200;
+
+  // Gold vs DXY daily return correlation (20d)
+  const goldRets=goldC&&goldC.length>1?goldC.slice(1).map(function(v,i){return v-goldC[i];}):null;
+  const dxyRets=dxyC&&dxyC.length>1?dxyC.slice(1).map(function(v,i){return v-dxyC[i];}):null;
+  const goldDxyCorr=corrPearson(goldRets,dxyRets,20);
+  const g2=goldDxyCorr!=null&&goldDxyCorr<-0.4;
+
+  const goldCount=(g1?1:0)+(g2?1:0);
+  const scoreGold=(goldCount/2)*15;
+
+  // ── BTC signals (weight 10%) ──────────────────────────────
+  const btc50d=btcDailyCloses&&btcDailyCloses.length>=50?sma(btcDailyCloses,50):null;
+  const b1=btcDailyCloses&&btc50d&&dxyC&&dxy200&&btcDailyCloses[btcDailyCloses.length-1]<btc50d&&dxyC[dxyC.length-1]>dxy200;
+  const btcRets=btcDailyCloses&&btcDailyCloses.length>1?btcDailyCloses.slice(1).map(function(v,i){return v-btcDailyCloses[i];}):null;
+  const btcDxyCorr=corrPearson(btcRets,dxyRets,20);
+  const b2=btcDxyCorr!=null&&btcDxyCorr<-0.4;
+  const btcCount=(b1?1:0)+(b2?1:0);
+  const scoreBTC=(btcCount/2)*10;
+
+  // ── VIX amplifier (+0 to +10) ─────────────────────────────
+  const vix50d=sma(vixC,50);
+  const v1=vixC&&vix50d&&vixC[vixC.length-1]>vix50d;
+  const vix10d=pctChg10d(vixC);
+  const v2=vix10d!=null&&vix10d>=15;
+  const vixRSI=rsiArr(vixC,14);
+  const v3=vixRSI!=null&&vixRSI>=60;
+  const vixCount=(v1?1:0)+(v2?1:0)+(v3?1:0);
+  const vixAmp=Math.min(10,(vixCount/3)*10);
+
+  const scoreBase=scoreDXY+scoreYLD+scoreGold+scoreBTC;
+  const score=Math.min(100,scoreBase+vixAmp);
+  const regime=score<=30?"GREEN":score<=60?"AMBER":"RED";
+
+  const action=regime==="GREEN"
+    ?"Risk-on · Accumulation OK · Leverage allowed"
+    :regime==="AMBER"
+    ?"Reduce leverage · Tighten stops · Raise cash"
+    :"No leverage · Hedge BTC · Defensive posture";
+
+  return {
+    score:Math.round(score*10)/10,
+    regime,action,
+    sigs:{
+      dxy:{count:dxyCount,of:4,score:scoreDXY.toFixed(1),val:dxyC?dxyC[dxyC.length-1].toFixed(2):null,rsi:dxyRSI?dxyRSI.toFixed(1):null},
+      us10y:{count:yldCount,of:3,score:scoreYLD.toFixed(1),val:us10yC?us10yC[us10yC.length-1].toFixed(3):null,rsi:yldRSI?yldRSI.toFixed(1):null},
+      gold:{count:goldCount,of:2,score:scoreGold.toFixed(1),val:goldC?goldC[goldC.length-1].toFixed(0):null},
+      btc:{count:btcCount,of:2,score:scoreBTC.toFixed(1)},
+      vix:{count:vixCount,of:3,amp:vixAmp.toFixed(1),val:vixC?vixC[vixC.length-1].toFixed(2):null,rsi:vixRSI?vixRSI.toFixed(1):null},
+    },
+    flags:{sig1,sig2,sig3,sig4,y1,y2,y3,g1,g2,b1,b2,v1,v2,v3},
+    vixAmp
+  };
+}
+
+// ── LiquidityBar component ────────────────────────────────────
+function LiquidityBar({liq,liqLoading}){
+  const score=liq&&liq.score!=null?liq.score:null;
+  const regime=liq?liq.regime:"—";
+  const action=liq?liq.action:"Calculating…";
+  const regColor=regime==="RED"?"#ff4d6d":regime==="AMBER"?"#f59e0b":regime==="GREEN"?"#00e5a0":"#8892a4";
+  const bgColor=regime==="RED"?"rgba(255,77,109,0.07)":regime==="AMBER"?"rgba(245,158,11,0.07)":regime==="GREEN"?"rgba(0,229,160,0.06)":"rgba(255,255,255,0.03)";
+  const barPct=score!=null?Math.min(100,score):0;
+  const barColor=barPct>60?"#ff4d6d":barPct>30?"#f59e0b":"#00e5a0";
+
+  // Mini signal pills for liquidity
+  const sigs=liq?liq.sigs:{};
+  const flags=liq?liq.flags:{};
+  const miniSigs=[
+    {l:"DXY",ok:sigs.dxy&&sigs.dxy.count>0,v:sigs.dxy&&sigs.dxy.val},
+    {l:"US10Y",ok:sigs.us10y&&sigs.us10y.count>0,v:sigs.us10y&&sigs.us10y.val?sigs.us10y.val+"%":null},
+    {l:"Gold",ok:sigs.gold&&sigs.gold.count>0,v:sigs.gold&&sigs.gold.val?"$"+sigs.gold.val:null},
+    {l:"VIX",ok:sigs.vix&&sigs.vix.count>0,v:sigs.vix&&sigs.vix.val},
+    {l:"BTC",ok:sigs.btc&&sigs.btc.count>0,v:null},
+  ];
+
+  return(
+    <div style={{margin:"10px 14px 0",borderRadius:14,background:bgColor,
+      border:`1px solid ${regColor}25`,padding:"13px 14px",
+      animation:"fadein 0.4s ease",position:"relative",overflow:"hidden"}}>
+      {/* Top accent line */}
+      <div style={{position:"absolute",top:0,left:0,right:0,height:2,background:`linear-gradient(90deg,${regColor},${regColor}30)`}}/>
+
+      {/* Header row */}
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10}}>
+        <div>
+          <div style={{fontSize:7.5,letterSpacing:"0.18em",color:"rgba(255,255,255,0.25)",textTransform:"uppercase",marginBottom:2}}>GLOBAL LIQUIDITY RISK</div>
+          <div style={{display:"flex",alignItems:"center",gap:8}}>
+            <div style={{fontSize:22,fontWeight:700,fontFamily:"'JetBrains Mono',monospace",color:"white",lineHeight:1}}>
+              {score!=null?score:"—"}
+            </div>
+            <div style={{fontSize:8,color:"rgba(255,255,255,0.2)"}}>/100</div>
+            <div style={{background:`${regColor}18`,border:`1px solid ${regColor}40`,borderRadius:5,padding:"3px 9px",fontSize:9,fontWeight:700,color:regColor,letterSpacing:"0.09em"}}>
+              {liqLoading&&score==null?"…":regime}
+            </div>
+          </div>
+        </div>
+        <div style={{textAlign:"right"}}>
+          <div style={{fontSize:7.5,color:"rgba(255,255,255,0.2)",letterSpacing:"0.1em",marginBottom:3}}>VIX AMP</div>
+          <div style={{fontSize:13,fontWeight:700,fontFamily:"'JetBrains Mono',monospace",color:liq&&liq.vixAmp>0?"#f59e0b":"rgba(255,255,255,0.3)"}}>+{liq?liq.vixAmp.toFixed(1):"0.0"}</div>
+        </div>
+      </div>
+
+      {/* Score bar */}
+      <div style={{background:"rgba(255,255,255,0.07)",borderRadius:99,height:5,marginBottom:10,overflow:"hidden"}}>
+        <div style={{height:"100%",width:barPct+"%",background:`linear-gradient(90deg,#00e5a0,${barColor})`,borderRadius:99,transition:"width 0.8s ease"}}/>
+      </div>
+      <div style={{display:"flex",justifyContent:"space-between",fontSize:7,color:"rgba(255,255,255,0.2)",marginBottom:10,letterSpacing:"0.05em"}}>
+        <span>GREEN 0–30</span>
+        <span>AMBER 30–60</span>
+        <span>RED 60+</span>
+      </div>
+
+      {/* Signal pills */}
+      <div style={{display:"flex",gap:5,flexWrap:"wrap",marginBottom:10}}>
+        {miniSigs.map(function({l,ok,v}){
+          const c=ok?"#f59e0b":"rgba(255,255,255,0.2)";
+          return<div key={l} style={{background:ok?"rgba(245,158,11,0.1)":"rgba(255,255,255,0.04)",
+            border:`1px solid ${ok?"rgba(245,158,11,0.25)":"rgba(255,255,255,0.08)"}`,
+            borderRadius:6,padding:"4px 8px",display:"flex",flexDirection:"column",alignItems:"center",minWidth:44}}>
+            <div style={{fontSize:7,color:"rgba(255,255,255,0.3)",letterSpacing:"0.06em",marginBottom:1}}>{l}</div>
+            <div style={{fontSize:8,fontWeight:700,color:c}}>{ok?"▲ ON":"● —"}</div>
+            {v&&<div style={{fontSize:7,color:"rgba(255,255,255,0.3)",marginTop:1,fontFamily:"'JetBrains Mono',monospace"}}>{v}</div>}
+          </div>;
+        })}
+      </div>
+
+      {/* Action line */}
+      <div style={{borderTop:"1px solid rgba(255,255,255,0.07)",paddingTop:8,display:"flex",alignItems:"center",gap:6}}>
+        <div style={{width:5,height:5,borderRadius:"50%",background:regColor,flexShrink:0}}/>
+        <div style={{fontSize:10,color:regColor,fontWeight:600,lineHeight:1.4}}>{action}</div>
+      </div>
+    </div>
+  );
+}
+
+async function tracked(url, fb, errs, proxied) {
+  fb = fb===undefined?null:fb; errs=errs||[]; proxied=proxied||[];
+  function withTimeout(promise, ms) {
+    return new Promise(function(res,rej){
+      var t=setTimeout(function(){rej(new Error("timeout"));},ms);
+      promise.then(function(v){clearTimeout(t);res(v);},function(e){clearTimeout(t);rej(e);});
+    });
+  }
   try {
-    const r = await fetch(url, {signal:AbortSignal.timeout(6000)});
+    var r = await withTimeout(fetch(url), 6000);
     if (r.ok) return await r.json();
   } catch(_) {}
   try {
     proxied.push(1);
-    const r = await fetch(`https://api.allorigins.win/get?url=${encodeURIComponent(url)}`,
-      {signal:AbortSignal.timeout(12000)});
-    if (!r.ok) throw new Error();
-    return JSON.parse((await r.json()).contents);
+    var r2 = await withTimeout(fetch("https://api.allorigins.win/get?url="+encodeURIComponent(url)), 12000);
+    if (!r2.ok) throw new Error();
+    return JSON.parse((await r2.json()).contents);
   } catch(_) { errs.push(url.split("?")[0].split("/").pop()); return fb; }
 }
 
@@ -301,6 +544,8 @@ function App(){
   const [sheet,setSheet]=useState(null); // "settings"|"checklist"|null
   const [tab,setTab]=useState("signals"); // "chart"|"signals"|"manual"
   const [glassnodeKey,setGlassnodeKey]=useState(()=>localStorage.getItem("gn_key")||"");
+  const [liq,setLiq]=useState(null);
+  const [liqLoading,setLiqLoading]=useState(true);
   const timer=useRef(null);
 
   const fetchAll=useCallback(async()=>{
@@ -325,18 +570,18 @@ function App(){
     ]);
 
     // ── Parse ──────────────────────────────────────────────
-    const btcPrice=price?.bitcoin?.usd, btcChg=price?.bitcoin?.usd_24h_change;
-    const dom=global?.data?.market_cap_percentage?.btc;
-    const fngVals=fng?.data?.map(x=>parseInt(x.value))?.reverse()??[];
-    const fngCur=fngVals[fngVals.length-1], fngLbl=fng?.data?.[0]?.value_classification??"—";
-    const fundRates=funding?.map(f=>parseFloat(f.fundingRate)*100)??[];
+    const btcPrice=(price&&price.bitcoin?price.bitcoin.usd:null), btcChg=(price&&price.bitcoin?price.bitcoin.usd_24h_change:null);
+    const dom=(global&&global.data&&global.data.market_cap_percentage?global.data.market_cap_percentage.btc:null);
+    const fngVals=(fng&&fng.data?fng.data.map(function(x){return parseInt(x.value);}).reverse():[]);
+    const fngCur=fngVals[fngVals.length-1], fngLbl=(fng&&fng.data&&fng.data[0]?fng.data[0].value_classification:"—");
+    const fundRates=(funding?funding.map(function(f){return parseFloat(f.fundingRate)*100;}):[]);
     const fundLast=fundRates[fundRates.length-1], fund8h=fundLast!=null?fundLast*3*365:null;
-    const oiVals=oiHist?.map(x=>parseFloat(x.sumOpenInterest)*(btcPrice||0))??[];
+    const oiVals=(oiHist?oiHist.map(function(x){return parseFloat(x.sumOpenInterest)*(btcPrice||0);}):[]);
     const oiChg=oiVals.length>=2?(oiVals[oiVals.length-1]-oiVals[0])/oiVals[0]*100:null;
     const oiTrend=oiChg!=null?(oiChg>3?"rising":oiChg<-3?"falling":"flat"):null;
     // OBV
-    const wklyCloses=wklyCandles?.map(c=>parseFloat(c[4]))??[];
-    const wklyObvArr=wklyCandles?calcOBV(wklyCandles):[];
+    const wklyCloses=(wklyCandles?wklyCandles.map(function(c){return parseFloat(c[4]);}):[]);
+    const wklyObvArr=(wklyCandles?calcOBV(wklyCandles):[]);
     const obvEMAArr=wklyObvArr.length>10?emaCalc(wklyObvArr,10):[];
     const obvLast=wklyObvArr[wklyObvArr.length-1], obvEMALast=obvEMAArr[obvEMAArr.length-1];
     const priceNow=wklyCloses[wklyCloses.length-1], price4w=wklyCloses[wklyCloses.length-5];
@@ -347,7 +592,7 @@ function App(){
     const rsiHistory=[];
     if(wklyCloses.length>26)for(let i=wklyCloses.length-12;i<wklyCloses.length;i++)rsiHistory.push(rsiCalc(wklyCloses.slice(0,i+1)));
     // Volume
-    const wklyVols=wklyCandles?.map(c=>parseFloat(c[5]))??[];
+    const wklyVols=(wklyCandles?wklyCandles.map(function(c){return parseFloat(c[5]);}):[]);
     const volMA20=wklyVols.length>=20?wklyVols.slice(-20).reduce((a,b)=>a+b,0)/20:null;
     const lastVol=wklyVols[wklyVols.length-1];
     const lastCdl=wklyCandles?parseFloat(wklyCandles[wklyCandles.length-1][4])-parseFloat(wklyCandles[wklyCandles.length-1][1]):0;
@@ -357,8 +602,8 @@ function App(){
     // ETF
     let etfFlows=[],etfLatest=null,etfSig="neutral",etfAvg7=null,etfMode="none";
     try{
-      let rows=etfData?.data&&Array.isArray(etfData.data)?etfData.data:Array.isArray(etfData)?etfData:null;
-      if(rows?.length>0){
+      let rows=etfData&&etfData.data&&Array.isArray(etfData.data)?etfData.data:Array.isArray(etfData)?etfData:null;
+      if(rows&&rows.length>0){
         if(rows[0].t!==undefined&&rows[0].v!==undefined){
           etfMode="glassnode";
           const h=rows.slice(-15).map(r=>r.v),fl=[];
@@ -382,8 +627,10 @@ function App(){
     // Reserves
     let resHist=[],resLatest=null,resTrend=null,resSig="neutral",resChg=null;
     try{
-      const rv=Array.isArray(reservesData)&&reservesData[0]?.v!==undefined?reservesData.map(p=>p.v):reservesData?.values?.map(p=>p.y):null;
-      if(rv?.length>1){
+      var rv=null;
+      if(Array.isArray(reservesData)&&reservesData[0]&&reservesData[0].v!==undefined){rv=reservesData.map(function(p){return p.v;});}
+      else if(reservesData&&reservesData.values){rv=reservesData.values.map(function(p){return p.y;});}
+      if(rv&&rv.length>1){
         resHist=rv.slice(-90); resLatest=resHist[resHist.length-1];
         const prev=resHist[Math.max(0,resHist.length-15)];
         resChg=prev?(resLatest-prev)/prev*100:null;
@@ -416,6 +663,22 @@ function App(){
   },[glassnodeKey]);
 
   useEffect(()=>{fetchAll();timer.current=setInterval(fetchAll,REFRESH);return()=>clearInterval(timer.current);},[fetchAll]);
+
+  // ── Fetch liquidity data (every 5 min, separate from BTC signals) ──
+  const fetchLiq=useCallback(async()=>{
+    setLiqLoading(true);
+    try{
+      const ld=await fetchLiquidityData(tracked);
+      // Get BTC daily closes from existing data or re-fetch
+      const btcRaw=await tracked("https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1d&limit=220",null);
+      const btcCloses=btcRaw?btcRaw.map(function(c){return parseFloat(c[4]);}):null;
+      const result=calcLiquidityScore(ld,btcCloses);
+      setLiq(result);
+    }catch(_){}
+    setLiqLoading(false);
+  },[]);
+
+  useEffect(()=>{fetchLiq();const t=setInterval(fetchLiq,300000);return()=>clearInterval(t);},[fetchLiq]);
 
   const OC=SIG[overall], fngColor=d.fngCur<25?"#00e5a0":d.fngCur<45?"#4ade80":d.fngCur<55?"#facc15":d.fngCur<75?"#fb923c":"#ff4d6d";
   const sigList=[
@@ -489,6 +752,9 @@ function App(){
         </div>
       </div>
 
+      {/* ── Liquidity Risk Section ── */}
+      <LiquidityBar liq={liq} liqLoading={liqLoading}/>
+
       {/* ── Tab content ── */}
       <div style={{padding:"12px 14px 0"}}>
 
@@ -508,10 +774,10 @@ function App(){
             {/* Quick stats under chart */}
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:10}}>
               {[
-                {l:"Fear & Greed",v:d.fngCur??"—",s:d.fngSig,note:d.fngLbl},
+                {l:"Fear & Greed",v:d.fngCur!=null?d.fngCur:"—",s:d.fngSig,note:d.fngLbl},
                 {l:"BTC Dominance",v:d.dom?d.dom.toFixed(1)+"%":"—",s:d.domSig,note:d.dom>52?"Rising":"Neutral"},
                 {l:"Funding Rate",v:d.fundLast!=null?(d.fundLast>=0?"+":"")+d.fundLast.toFixed(4)+"%":"—",s:d.fundSig,note:"Binance perps"},
-                {l:"Open Interest",v:d.oiVals?.length?bil(d.oiVals[d.oiVals.length-1]):"—",s:d.oiSig,note:`14d: ${d.oiChg!=null?pct(d.oiChg,1):"—"}`},
+                {l:"Open Interest",v:(d.oiVals&&d.oiVals.length?bil(d.oiVals[d.oiVals.length-1]):"—"),s:d.oiSig,note:`14d: ${d.oiChg!=null?pct(d.oiChg,1):"—"}`},
               ].map(({l,v,s,note})=>{
                 const c=SIG[s]||SIG.neutral;
                 return<div key={l} style={{background:"rgba(255,255,255,0.03)",border:`1px solid ${c}20`,borderRadius:12,padding:"11px 13px"}}>
@@ -529,11 +795,11 @@ function App(){
         {tab==="signals"&&(
           <div style={{display:"flex",flexDirection:"column",gap:10,animation:"fadein 0.3s ease"}}>
 
-            <Card title="Fear & Greed Index" value={d.fngCur??"—"} accent
+            <Card title="Fear & Greed Index" value={d.fngCur!=null?d.fngCur:"—"} accent
               sub={`${d.fngLbl} · <30 = buy zone, >70 = sell zone`}
               sig={d.fngSig} loading={loading&&!d.fngCur}
               spark={d.fngVals} sparkColor={fngColor}
-              note={`7-day: ${d.fngVals?.join(" → ")||"—"}`}/>
+              note={`7-day: ${(d.fngVals?d.fngVals.join(" → "):"—")}`}/>
 
             {/* Dominance */}
             <div style={{background:"rgba(255,255,255,0.03)",border:`1px solid ${d.domSig==="bull"?"rgba(0,229,160,0.18)":"rgba(255,255,255,0.07)"}`,borderRadius:14,padding:"15px 16px",animation:"fadein 0.35s ease"}}>
@@ -556,17 +822,17 @@ function App(){
               note={d.fundLast<-0.005?"Negative → shorts paying → bullish squeeze":d.fundLast>0.01?"Positive → longs overheated → fade rallies":"Neutral → no derivatives bias"}/>
 
             <Card title="Open Interest (Binance Perps)" accent
-              value={d.oiVals?.length?bil(d.oiVals[d.oiVals.length-1]):"—"}
-              sub={`14d: ${d.oiChg!=null?pct(d.oiChg,1):"—"} · ${d.oiTrend??"—"}`}
-              sig={d.oiSig} loading={loading&&!d.oiVals?.length}
-              spark={d.oiVals?.map(v=>v/1e9)} sparkColor={SIG[d.oiSig]}
+              value={(d.oiVals&&d.oiVals.length?bil(d.oiVals[d.oiVals.length-1]):"—")}
+              sub={`14d: ${d.oiChg!=null?pct(d.oiChg,1):"—"} · ${d.oiTrend||"—"}`}
+              sig={d.oiSig} loading={loading&&!(d.oiVals&&d.oiVals.length)}
+              spark={(d.oiVals?d.oiVals.map(function(v){return v/1e9;}):null)} sparkColor={SIG[d.oiSig]}
               note={d.oiTrend==="rising"&&d.btcChg>0?"OI ↑ + Price ↑ → conviction longs":d.oiTrend==="rising"&&d.btcChg<0?"OI ↑ + Price ↓ → conviction shorts":"OI falling → positions closing"}/>
 
             <Card title="Weekly OBV" accent
               value={d.obvLast!=null&&d.obvEMALast!=null?(d.obvLast>d.obvEMALast?"▲ ABOVE MA":"▼ BELOW MA"):"—"}
               sub={d.obvBullDiv?"🟢 Hidden bull divergence — OBV ↑ while price ↓":d.obvBearDiv?"🔴 Bear divergence — OBV ↓ while price ↑":d.obvAboveMA?"Accumulation in progress":"Distribution / selling pressure"}
-              sig={d.obvSig} loading={loading&&!d.wklyObvArr?.length}
-              spark={d.wklyObvArr?.slice(-20)} sparkColor={SIG[d.obvSig]}
+              sig={d.obvSig} loading={loading&&!(d.wklyObvArr&&d.wklyObvArr.length)}
+              spark={(d.wklyObvArr?d.wklyObvArr.slice(-20):null)} sparkColor={SIG[d.obvSig]}
               note="Dishner: OBV must be ABOVE its MA for long bias. Divergence from price = strongest signal."/>
 
             {/* RSI */}
@@ -582,7 +848,7 @@ function App(){
                   </div>
                   <div style={{marginTop:7,display:"flex",alignItems:"center",gap:8}}>
                     <Badge sig={d.rsiSig}/>
-                    {d.rsiHistory?.length>0&&<Spark data={d.rsiHistory} color={d.rsiSig==="bull"?"#00e5a0":d.rsiSig==="bear"?"#ff4d6d":"#facc15"} h={22}/>}
+                    {d.rsiHistory&&d.rsiHistory.length>0&&<Spark data={d.rsiHistory} color={d.rsiSig==="bull"?"#00e5a0":d.rsiSig==="bear"?"#ff4d6d":"#facc15"} h={22}/>}
                   </div>
                 </div>
               </div>
@@ -594,22 +860,22 @@ function App(){
             <Card title="Weekly Volume Structure" accent
               value={d.volRatio!=null?d.volRatio.toFixed(2)+"× avg":"—"}
               sub={d.volCapit?"🟢 Capitulation — vol spike on red close":d.volDist?"🔴 Distribution — vol spike on green close":"Normal volume — no structural signal"}
-              sig={d.volSig} loading={loading&&!d.wklyVols?.length}
-              spark={d.wklyVols?.slice(-20)} sparkColor={SIG[d.volSig]}
+              sig={d.volSig} loading={loading&&!(d.wklyVols&&d.wklyVols.length)}
+              spark={(d.wklyVols?d.wklyVols.slice(-20):null)} sparkColor={SIG[d.volSig]}
               note="Dishner: Big red vol candle at lows = exhaustion/reversal. Volume must confirm the move."/>
 
             <Card title="BTC Spot ETF Flows (Daily)" accent
               value={d.etfLatest!=null?(d.etfLatest>=0?"+":"")+d.etfLatest.toFixed(0)+(d.etfMode==="glassnode"?" BTC":" M USD"):glassnodeKey?"Loading…":"Add API key"}
               sub={d.etfAvg7!=null?(d.etfMode==="glassnode"?`7d avg: ${d.etfAvg7>=0?"+":""}${d.etfAvg7.toFixed(0)} BTC/day · Glassnode`:`7d avg: ${d.etfAvg7>=0?"+":""}${d.etfAvg7.toFixed(0)}M USD`):glassnodeKey?"Fetching from Glassnode…":"Tap ⚙ to add free Glassnode key"}
-              sig={d.etfSig??"neutral"} loading={loading&&!d.etfFlows?.length}
-              spark={d.etfFlows} sparkColor={SIG[d.etfSig??"neutral"]}
+              sig={d.etfSig||"neutral"} loading={loading&&!(d.etfFlows&&d.etfFlows.length)}
+              spark={d.etfFlows} sparkColor={SIG[d.etfSig||"neutral"]}
               note={d.etfLatest==null?(glassnodeKey?"Key set but no data — check key at studio.glassnode.com":"No API key. Tap ⚙ above. Backup: farside.co.uk"):d.etfSig==="bull"?"Net inflows → institutions buying → bullish demand":d.etfSig==="bear"?"Net outflows → institutional selling → bearish":"Mixed ETF flows — no strong directional bias"}/>
 
             <Card title="BTC Exchange Reserves" accent
               value={d.resLatest!=null?new Intl.NumberFormat("en-US",{notation:"compact",maximumFractionDigits:2}).format(d.resLatest/1e6)+"M BTC":glassnodeKey?"Loading…":"Add API key"}
               sub={d.resTrend&&d.resChg!=null?`14d: ${d.resChg>=0?"+":""}${d.resChg.toFixed(2)}% · trend: ${d.resTrend} · Glassnode`:glassnodeKey?"Fetching from Glassnode…":"Tap ⚙ to add free Glassnode key"}
-              sig={d.resSig??"neutral"} loading={loading&&!d.resHist?.length}
-              spark={d.resHist} sparkColor={SIG[d.resSig??"neutral"]}
+              sig={d.resSig||"neutral"} loading={loading&&!(d.resHist&&d.resHist.length)}
+              spark={d.resHist} sparkColor={SIG[d.resSig||"neutral"]}
               note={d.resLatest==null?(glassnodeKey?"Key set but no data — verify at studio.glassnode.com/settings/api":"No API key. Tap ⚙. Backup: cryptoquant.com"):d.resSig==="bull"?"Reserves falling → BTC leaving exchanges → supply squeeze (bullish)":d.resSig==="bear"?"Reserves rising → BTC moving TO exchanges → sell pressure":"Reserves stable — no supply shock signal"}/>
 
             {/* Checklist CTA */}
